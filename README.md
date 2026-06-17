@@ -106,3 +106,96 @@ If you want to keep learning by building (rather than just bolting on infra), th
 6. **circuit breaker + service mesh exploration** — once you have 5+ services calling each other, introduce `cockatiel` or `opossum` for breaker logic, then experiment with Linkerd as a learning exercise even if you don't run it in production.
 
 This order keeps every step Core-adjacent and immediately useful, while still exposing you to the patterns (gateway, event sourcing, CQRS, circuit breaking, service mesh) that show up in every enterprise architecture discussion.
+
+---
+
+## 6. Where does the API gateway fit, and where does domain logic live?
+
+A common point of confusion: the gateway is **not** a domain service. It has no idea what a "student," "grade," or "enrollment" is — it's pure traffic plumbing:
+
+1. **Single entry point** — web and mobile both call the *same* gateway URL instead of knowing the address of 7 different services.
+2. **Auth token validation** — checks "is this JWT valid," but does NOT decide what the user is allowed to do — that's RBAC's job, called right after.
+3. **Routing** — `/api/students/*` → student-portal-core, `/api/files/*` → file-storage, etc.
+4. **Cross-cutting concerns** — rate limiting, CORS, request logging, per-client response shaping.
+
+This is exactly why one shared auth + RBAC setup works cleanly across web and mobile: the identity layer doesn't care which client made the call.
+
+**The missing piece in a service list like auth/rbac/sms/email/file-storage/audit/cron is the domain layer.** All seven of those are platform/infrastructure services — generic, reusable across any product, with zero knowledge of "students" or "courses." You still need one or more **domain/core services** that own your actual business logic (enrollment, grades, attendance, course catalog). That service is the thing that *calls* auth, rbac, email, sms, file-storage, and audit — it's not parallel to them, it sits in the middle and orchestrates them.
+
+```
+Platform services (generic, reusable):  auth, rbac, sms, email, file-storage, audit, cron
+Domain service (your actual product):   student-portal-core  →  calls the platform services above
+```
+
+## 7. Example: student portal request flow (web + mobile, shared identity)
+
+Scenario: a teacher posts a grade through the web app; a student checks their attendance through the mobile app. Both go through the same identity and permission layer because they're the same user base on different clients.
+
+```
+┌──────────────┐                              ┌──────────────┐
+│   Web app    │                              │  Mobile app  │
+└──────┬───────┘                              └──────┬───────┘
+       │                                              │
+       └───────────────────┬──────────────────────────┘
+                            ▼
+                  ┌───────────────────┐
+                  │    API gateway     │   ← single entry point,
+                  │  routing + rate    │     same for both clients
+                  │  limit + CORS      │
+                  └─────────┬──────────┘
+                            ▼
+                  ┌───────────────────┐
+                  │   Auth service     │   ← "is this token valid?"
+                  │  validates JWT,    │     shared identity model,
+                  │  shared identity   │     same for web + mobile
+                  └─────────┬──────────┘
+                            ▼
+                  ┌───────────────────┐
+                  │   RBAC service     │   ← "is this user allowed
+                  │  checks role +     │     to do THIS action?"
+                  │  permission        │
+                  └─────────┬──────────┘
+                            ▼
+                  ┌────────────────────────┐
+                  │  student-portal-core    │   ← YOUR domain logic:
+                  │  enrollment, grades,    │     enrollment, grades,
+                  │  attendance, courses    │     attendance, courses
+                  └───┬──────┬──────┬───┬───┘
+            (queue)   │      │      │   │   (queue)
+              ┌───────┘      │      │   └───────┐
+              ▼              ▼      ▼           ▼
+        ┌──────────┐  ┌──────────┐ ┌──────────┐ ┌──────────┐
+        │  Email   │  │   SMS    │ │  File    │ │  Audit   │
+        │ grade    │  │ absence  │ │ storage  │ │  log     │
+        │ posted   │  │ notice   │ │ uploads  │ │ records  │
+        │ alert    │  │          │ │          │ │ action   │
+        └──────────┘  └──────────┘ └──────────┘ └──────────┘
+
+   All four above are consumed via RabbitMQ / BullMQ queues,
+   not direct synchronous calls — student-portal-core fires an
+   event and moves on, it doesn't wait for the email to send.
+
+                  ┌───────────────────┐
+                  │   Cron-job service  │   ← runs on a schedule,
+                  │  no client request  │     no client involved at all
+                  │  needed              │
+                  └─────────┬───────────┘
+                            │
+              fires jobs directly into the
+              same queues as student-portal-core
+                            │
+              ┌─────────────┴─────────────┐
+              ▼                           ▼
+        nightly attendance         weekly grade
+        summary → Email            digest → SMS
+```
+
+**Why this shape works for your case:**
+
+- **Web and mobile converge at the gateway**, not before it. Neither client talks to auth/rbac/student-portal-core directly — they only know the gateway's address. This is what makes "same users, different clients" simple: there's exactly one place identity gets checked, regardless of which app made the call.
+- **Auth and RBAC are two separate, sequential checks**, not one combined step. Auth answers "who is this." RBAC answers "what can they do." Keeping them separate is what lets you reuse the exact same identity model across a student portal, a teacher portal, and a parent portal, while still giving each role different permissions.
+- **student-portal-core is the only service that knows what a "grade" or "course" is.** Auth, rbac, email, sms, file-storage, audit, and cron are all completely reusable — you could lift every one of them into an entirely different product (an e-commerce app, a clinic system) and they wouldn't need to change. Only student-portal-core is specific to "student portal."
+- **The fan-out to email/sms/file-storage/audit is async on purpose.** When a teacher posts a grade, the request shouldn't hang while an email goes out — student-portal-core publishes an event (RabbitMQ) or enqueues a job (BullMQ) and immediately returns success to the gateway. The notification arriving 2 seconds later is fine; the teacher's UI shouldn't wait for it.
+- **Cron-job is the only service in this diagram with no client in its path at all.** It wakes up on a schedule, decides "time to send the weekly digest," and pushes straight into the same queues student-portal-core uses — from the email/sms services' point of view, a cron-triggered job and a student-portal-core-triggered job look identical.
+
+**A second domain service is normal, not a smell.** As the student portal grows, you'll likely split `student-portal-core` further — e.g. `enrollment-service`, `grading-service`, `attendance-service` — once each grows complex enough to deserve its own database schema and team ownership. The platform services (auth/rbac/email/sms/file-storage/audit/cron) stay exactly as they are; only the domain layer fans out.
